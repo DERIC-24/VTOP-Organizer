@@ -1,0 +1,27 @@
+
+{
+  "manifest_version": 3,
+  "name": "VTOP Organizer",
+  "version": "0.1.0",
+  "description": "Organize and download VTOP course materials.",
+
+  "permissions": [
+    "sidePanel"
+  ],
+
+  "host_permissions": [
+    "https://vtop.vit.ac.in/*"
+  ],
+
+  "background": {
+    "service_worker": "background/service-worker.js"
+  },
+
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  },
+
+  "action": {
+    "default_title": "Open VTOP Organizer"
+  }
+}
