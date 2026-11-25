@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 
@@ -26,7 +25,7 @@
 
     <main>
 
-        <section class="status-card">
+        <section class="card status-card">
             <span class="label">CONNECTION STATUS</span>
 
             <h2 id="status-title">
@@ -36,9 +35,39 @@
             <p id="status-description">
                 Detecting the current website.
             </p>
+
+            <button id="refresh-button" type="button">
+                Refresh &amp; Scan Course
+            </button>
         </section>
 
-        <section class="course-card">
+        <section class="card folder-card">
+            <span class="label">DESTINATION DIRECTORY</span>
+
+            <h2 id="folder-name">
+                No folder selected
+            </h2>
+
+            <p id="folder-status">
+                Choose a folder to store course materials.
+            </p>
+
+            <div class="button-row">
+                <button id="choose-folder-button" type="button">
+                    Choose Folder
+                </button>
+                <button id="reauthorize-folder-button" type="button" class="secondary-btn hidden">
+                    Re-authorize
+                </button>
+                <button id="test-file-button" type="button" class="secondary-btn" disabled>
+                    Write Test File
+                </button>
+            </div>
+
+            <p id="fs-feedback" class="feedback hidden"></p>
+        </section>
+
+        <section class="card course-card">
             <span class="label">CURRENT COURSE</span>
 
             <h2 id="course-name">
@@ -46,21 +75,32 @@
             </h2>
 
             <p id="course-code">
-                Waiting for VTOP integration
+                Waiting for VTOP course page
             </p>
         </section>
 
-        <button id="refresh-button">
-            Refresh connection
-        </button>
+        <section class="card materials-card">
+            <div class="card-header-row">
+                <span class="label">EXTRACTED MATERIALS</span>
+                <span id="materials-badge" class="badge">0</span>
+            </div>
+
+            <p id="materials-summary">
+                Open Course Page Consolidated and click Refresh &amp; Scan Course.
+            </p>
+
+            <p id="materials-error" class="feedback error hidden"></p>
+
+            <ul id="materials-list" class="materials-list hidden"></ul>
+        </section>
 
     </main>
 
     <footer>
-        VTOP Organizer · Version 0.1.0
+        VTOP Organizer · Version 0.1.0 (Stage 2 Foundation)
     </footer>
 
-    <script src="sidepanel.js"></script>
+    <script type="module" src="sidepanel.js"></script>
 
 </body>
 </html>

@@ -6,7 +6,9 @@
   "description": "Organize and download VTOP course materials.",
 
   "permissions": [
-    "sidePanel"
+    "sidePanel",
+    "storage",
+    "scripting"
   ],
 
   "host_permissions": [
@@ -16,6 +18,29 @@
   "background": {
     "service_worker": "background/service-worker.js"
   },
+
+  "content_scripts": [
+    {
+      "matches": [
+        "https://vtop.vit.ac.in/*"
+      ],
+      "js": [
+        "content/main-bridge.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://vtop.vit.ac.in/*"
+      ],
+      "js": [
+        "content/course-parser.js",
+        "content/vtop-detector.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
 
   "side_panel": {
     "default_path": "sidepanel/sidepanel.html"
