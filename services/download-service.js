@@ -1,13 +1,20 @@
 import { cleanVtopFilename, getFileExtension, parseContentDisposition } from "../utils/filename-parser.js";
 
 const ALLOWED_VTOP_ORIGIN = "https://vtop.vit.ac.in";
+const MAX_404_INSPECT_BYTES = 2048;
+const AUTH_REDIRECT_PATH_PATTERN = /\/(?:vtop\/)?(?:login|openPage|prelogin|sessionExpired|authenticate)/i;
+const AUTH_HTML_MARKER_PATTERN =
+    /(?:session\s*(?:expired|timed\s*out|invalid)|please\s*log\s*in|vtop\s*login|name\s*=\s*["']?j_username|action\s*=\s*["'][^"']*\/login)/i;
 
 export class DownloadError extends Error {
-    constructor(code, message, status = null) {
+    constructor(code, message, status = null, { isAuthFailure = false } = {}) {
         super(message);
         this.name = "DownloadError";
         this.code = code;
         this.status = status;
+        if (isAuthFailure) {
+            this.isAuthFailure = true;
+        }
     }
 }
 
@@ -109,7 +116,173 @@ export function validateDownloadedBinary({ status, ok, redirected, contentType, 
     };
 }
 
-export async function downloadMaterial({ formAction, formEntries, fileId, fallbackTitle = "material" }) {
+export function parseContentLength(headerValue) {
+    if (typeof headerValue !== "string" || !headerValue.trim()) {
+        return null;
+    }
+    const trimmed = headerValue.trim();
+    if (!/^\d+$/.test(trimmed)) {
+        return null;
+    }
+    const parsed = Number(trimmed);
+    if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+        return null;
+    }
+    return parsed;
+}
+
+export function buildProgressState(bytesReceived, totalBytes) {
+    const safeBytes = Number.isFinite(bytesReceived) && bytesReceived >= 0 ? bytesReceived : 0;
+    const knownTotal = Number.isSafeInteger(totalBytes) && totalBytes > 0 ? totalBytes : null;
+    const indeterminate = knownTotal === null;
+    const percent =
+        knownTotal !== null
+            ? Math.min(100, Math.round((safeBytes / knownTotal) * 100))
+            : null;
+
+    return {
+        bytesReceived: safeBytes,
+        totalBytes: knownTotal,
+        percent,
+        indeterminate
+    };
+}
+
+function safeNotifyProgress(onProgress, progress) {
+    if (typeof onProgress !== "function") {
+        return;
+    }
+    try {
+        onProgress(progress);
+    } catch {
+        // Progress listener errors must never interrupt a valid download
+    }
+}
+
+async function readResponseBufferWithProgress(response, totalBytes, onProgress) {
+    if (!response.body || typeof response.body.getReader !== "function") {
+        const buffer = await response.arrayBuffer();
+        safeNotifyProgress(onProgress, buildProgressState(buffer.byteLength, totalBytes));
+        return buffer;
+    }
+
+    const reader = response.body.getReader();
+    const chunks = [];
+    let bytesReceived = 0;
+
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+                break;
+            }
+            if (!value || value.byteLength === 0) {
+                continue;
+            }
+            const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+            chunks.push(chunk);
+            bytesReceived += chunk.byteLength;
+            safeNotifyProgress(onProgress, buildProgressState(bytesReceived, totalBytes));
+        }
+    } finally {
+        reader.releaseLock?.();
+    }
+
+    if (bytesReceived === 0) {
+        safeNotifyProgress(onProgress, buildProgressState(0, totalBytes));
+        return new ArrayBuffer(0);
+    }
+
+    const combined = new Uint8Array(bytesReceived);
+    let offset = 0;
+    for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return combined.buffer;
+}
+
+async function readBoundedPrefix(response, maxBytes = MAX_404_INSPECT_BYTES) {
+    if (!response.body || typeof response.body.getReader !== "function") {
+        return new Uint8Array(0);
+    }
+
+    const reader = response.body.getReader();
+    const chunks = [];
+    let totalRead = 0;
+    let reachedCap = false;
+
+    try {
+        while (totalRead < maxBytes) {
+            const { done, value } = await reader.read();
+            if (done) {
+                break;
+            }
+            if (!value || value.byteLength === 0) {
+                continue;
+            }
+            const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+            const remaining = maxBytes - totalRead;
+            if (chunk.byteLength >= remaining) {
+                chunks.push(chunk.subarray(0, remaining));
+                totalRead += remaining;
+                reachedCap = true;
+                break;
+            }
+            chunks.push(chunk);
+            totalRead += chunk.byteLength;
+        }
+    } finally {
+        if (reachedCap) {
+            await reader.cancel().catch(() => {});
+        }
+        reader.releaseLock?.();
+    }
+
+    const prefix = new Uint8Array(totalRead);
+    let offset = 0;
+    for (const chunk of chunks) {
+        prefix.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return prefix;
+}
+
+async function detectAuthFailureOn404(response, contentType) {
+    if (typeof response.url === "string" && response.url) {
+        try {
+            const resolved = new URL(response.url);
+            if (AUTH_REDIRECT_PATH_PATTERN.test(resolved.pathname)) {
+                await response.body?.cancel?.().catch(() => {});
+                return true;
+            }
+        } catch {
+            // Ignore invalid response.url
+        }
+    }
+
+    const normalizedType = (contentType || "").toLowerCase();
+    if (!normalizedType.includes("text/html") && !normalizedType.includes("application/xhtml+xml")) {
+        await response.body?.cancel?.().catch(() => {});
+        return false;
+    }
+
+    const prefixBytes = await readBoundedPrefix(response, MAX_404_INSPECT_BYTES);
+    if (prefixBytes.byteLength === 0) {
+        return false;
+    }
+
+    const prefixText = new TextDecoder("utf-8", { fatal: false }).decode(prefixBytes);
+    return AUTH_HTML_MARKER_PATTERN.test(prefixText);
+}
+
+export async function downloadMaterial({
+    formAction,
+    formEntries,
+    fileId,
+    fallbackTitle = "material",
+    onProgress = null
+}) {
     let targetUrl;
     try {
         targetUrl = new URL(formAction);
@@ -128,9 +301,37 @@ export async function downloadMaterial({ formAction, formEntries, fileId, fallba
         body
     });
 
-    const buffer = await response.arrayBuffer();
     const contentType = response.headers.get("content-type") || "";
     const contentDisposition = response.headers.get("content-disposition") || "";
+    const totalBytes = parseContentLength(response.headers.get("content-length"));
+
+    // Reject non-2xx responses before streaming body or emitting progress
+    if (!response.ok) {
+        if (response.status === 404) {
+            const isAuthFailure = await detectAuthFailureOn404(response, contentType);
+            if (isAuthFailure) {
+                throw new DownloadError(
+                    "SESSION_EXPIRED",
+                    "VTOP session expired (HTTP 404 login or session-expiry response).",
+                    404,
+                    { isAuthFailure: true }
+                );
+            }
+        } else {
+            await response.body?.cancel?.().catch(() => {});
+        }
+
+        validateDownloadedBinary({
+            status: response.status,
+            ok: response.ok,
+            redirected: response.redirected,
+            contentType,
+            contentDisposition,
+            buffer: new ArrayBuffer(0)
+        });
+    }
+
+    const buffer = await readResponseBufferWithProgress(response, totalBytes, onProgress);
 
     const validated = validateDownloadedBinary({
         status: response.status,
@@ -151,6 +352,7 @@ export async function downloadMaterial({ formAction, formEntries, fileId, fallba
         rawFilename: validated.rawFilename,
         cleanFilename,
         contentType,
-        byteLength: buffer.byteLength
+        byteLength: buffer.byteLength,
+        totalBytes
     };
 }

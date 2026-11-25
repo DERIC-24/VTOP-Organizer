@@ -1,11 +1,22 @@
 import {
     createStage2TestFile,
+    ensureSubdirectory,
     loadDirectoryHandle,
     pickAndSaveDirectory,
     requestDirectoryPermission,
-    verifyDirectoryPermission
+    verifyDirectoryPermission,
+    writeBinaryFile
 } from "../services/file-system.js";
 import { downloadMaterial } from "../services/download-service.js";
+import {
+    createFileSystemSaveAdapter,
+    DownloadQueueManager,
+    getAll404SessionWarning,
+    ORGANIZATION_MODES,
+    QUEUE_EVENTS
+} from "../services/queue-manager.js";
+
+const ORG_MODE_STORAGE_KEY = "vtop_organizer_org_mode";
 
 const statusTitle = document.getElementById("status-title");
 const statusDescription = document.getElementById("status-description");
@@ -26,16 +37,54 @@ const materialsSummaryEl = document.getElementById("materials-summary");
 const materialsErrorEl = document.getElementById("materials-error");
 const materialsListEl = document.getElementById("materials-list");
 
+const organizationModeSelect = document.getElementById("organization-mode");
+const startDownloadButton = document.getElementById("start-download-button");
+const queueProgressBox = document.getElementById("queue-progress-box");
+const queueProgressText = document.getElementById("queue-progress-text");
+const queueProgressPercent = document.getElementById("queue-progress-percent");
+const queueProgressBar = document.getElementById("queue-progress-bar");
+const fileProgressText = document.getElementById("file-progress-text");
+const fileProgressPercent = document.getElementById("file-progress-percent");
+const fileProgressBar = document.getElementById("file-progress-bar");
+
 const state = {
     dirHandle: null,
     dirPermission: "none",
-    extraction: null
+    extraction: null,
+    queueRunning: false,
+    itemStatusEls: new Map()
 };
 
 // Expose Stage 2 services on window for controlled console inspection without storing secrets
 globalThis.__vtopOrganizerStage2 = {
     downloadMaterial
 };
+
+const saveMaterialAdapter = createFileSystemSaveAdapter({
+    getRootHandle: () => state.dirHandle,
+    verifyDirectoryPermission,
+    ensureSubdirectory,
+    writeBinaryFile
+});
+
+const queueManager = new DownloadQueueManager({
+    downloadMaterial,
+    saveMaterial: saveMaterialAdapter,
+    onEvent: handleQueueEvent
+});
+
+function formatBytes(bytes) {
+    if (!Number.isFinite(bytes) || bytes < 0) {
+        return "0 B";
+    }
+    if (bytes < 1024) {
+        return `${bytes} B`;
+    }
+    if (bytes < 1024 * 1024) {
+        return `${(bytes / 1024).toFixed(1)} KB`;
+    }
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
 
 function showFeedback(element, message, isError = false) {
     element.textContent = message;
@@ -50,8 +99,163 @@ function hideElement(element) {
     element.textContent = "";
 }
 
+function updateDownloadControlState() {
+    const hasMaterials = Boolean(
+        state.extraction?.ok &&
+            state.extraction?.formAvailable &&
+            Array.isArray(state.extraction?.materials) &&
+            state.extraction.materials.some((m) => m.hasValidFileId)
+    );
+    const hasWritePermission = Boolean(state.dirHandle && state.dirPermission === "granted");
+
+    startDownloadButton.disabled = state.queueRunning || !hasMaterials || !hasWritePermission;
+    organizationModeSelect.disabled = state.queueRunning;
+    refreshButton.disabled = state.queueRunning;
+    chooseFolderButton.disabled = state.queueRunning;
+    reauthorizeFolderButton.disabled = state.queueRunning;
+    testFileButton.disabled = state.queueRunning || !hasWritePermission;
+}
+
+function renderQueueSnapshotProgress(snapshot) {
+    if (!snapshot) {
+        return;
+    }
+    queueProgressBox.classList.remove("hidden");
+    queueProgressBar.max = Math.max(1, snapshot.total);
+    queueProgressBar.value = snapshot.processed;
+    queueProgressPercent.textContent = `${snapshot.queuePercent}%`;
+
+    const summaryParts = [
+        `${snapshot.processed}/${snapshot.total}`,
+        `${snapshot.completed} ok`
+    ];
+    if (snapshot.failed > 0) {
+        summaryParts.push(`${snapshot.failed} failed`);
+    }
+    if (snapshot.skipped > 0) {
+        summaryParts.push(`${snapshot.skipped} skipped`);
+    }
+    queueProgressText.textContent = `Queue: ${summaryParts.join(" · ")}`;
+}
+
+function renderActiveFileProgress({ topic, attempt, maxAttempts, progress }) {
+    if (!progress) {
+        return;
+    }
+    const prefix = attempt ? `${topic} (Attempt ${attempt}/${maxAttempts})` : topic;
+
+    if (progress.indeterminate) {
+        fileProgressBar.removeAttribute("value");
+        fileProgressText.textContent = `${prefix}: ${formatBytes(progress.bytesReceived)} received`;
+        fileProgressPercent.textContent = "Streaming...";
+    } else {
+        fileProgressBar.max = progress.totalBytes;
+        fileProgressBar.value = Math.min(progress.bytesReceived, progress.totalBytes);
+        fileProgressText.textContent =
+            `${prefix}: ${formatBytes(progress.bytesReceived)} / ${formatBytes(progress.totalBytes)}`;
+        fileProgressPercent.textContent = `${progress.percent}%`;
+    }
+}
+
+function updateMaterialItemBadge(fileId, text) {
+    const tag = state.itemStatusEls.get(fileId);
+    if (tag) {
+        tag.textContent = text;
+    }
+}
+
+function handleQueueEvent(event) {
+    const { type, snapshot } = event;
+    renderQueueSnapshotProgress(snapshot);
+
+    if (type === QUEUE_EVENTS.QUEUE_STARTED) {
+        state.queueRunning = true;
+        updateDownloadControlState();
+        fileProgressBar.removeAttribute("value");
+        fileProgressText.textContent = "Starting sequential downloads...";
+        fileProgressPercent.textContent = "";
+        return;
+    }
+
+    if (type === QUEUE_EVENTS.MATERIAL_ATTEMPT_STARTED) {
+        updateMaterialItemBadge(event.fileId, `Downloading (${event.attempt}/${event.maxAttempts})`);
+        renderActiveFileProgress({
+            topic: event.topic,
+            attempt: event.attempt,
+            maxAttempts: event.maxAttempts,
+            progress: { bytesReceived: 0, totalBytes: null, percent: null, indeterminate: true }
+        });
+        return;
+    }
+
+    if (type === QUEUE_EVENTS.MATERIAL_PROGRESS) {
+        renderActiveFileProgress({
+            topic: event.topic,
+            attempt: event.attempt,
+            maxAttempts: event.maxAttempts,
+            progress: event.progress
+        });
+        if (!event.progress.indeterminate) {
+            updateMaterialItemBadge(event.fileId, `${event.progress.percent}%`);
+        } else {
+            updateMaterialItemBadge(event.fileId, formatBytes(event.progress.bytesReceived));
+        }
+        return;
+    }
+
+    if (type === QUEUE_EVENTS.MATERIAL_STATE_CHANGED) {
+        if (event.state === "retrying") {
+            updateMaterialItemBadge(event.fileId, `Retrying (${event.attempts})`);
+        } else if (event.state === "failed") {
+            updateMaterialItemBadge(event.fileId, `Failed (${event.error?.code || "ERROR"})`);
+        } else if (event.state === "skipped") {
+            updateMaterialItemBadge(event.fileId, "Skipped");
+        }
+        return;
+    }
+
+    if (type === QUEUE_EVENTS.MATERIAL_COMPLETED) {
+        updateMaterialItemBadge(event.fileId, `Saved: ${event.savedFilename}`);
+        renderActiveFileProgress({
+            topic: event.savedFilename || event.topic,
+            attempt: null,
+            maxAttempts: null,
+            progress: {
+                bytesReceived: event.byteLength || 0,
+                totalBytes: event.byteLength || null,
+                percent: event.byteLength ? 100 : null,
+                indeterminate: !event.byteLength
+            }
+        });
+        return;
+    }
+
+    if (
+        type === QUEUE_EVENTS.QUEUE_COMPLETED ||
+        type === QUEUE_EVENTS.QUEUE_COMPLETED_WITH_ERRORS
+    ) {
+        state.queueRunning = false;
+        updateDownloadControlState();
+        fileProgressText.textContent =
+            type === QUEUE_EVENTS.QUEUE_COMPLETED
+                ? `All ${snapshot.completed} file(s) downloaded and saved.`
+                : `Finished: ${snapshot.completed} saved, ${snapshot.failed} failed.`;
+        fileProgressPercent.textContent = "Done";
+        fileProgressBar.max = 100;
+        fileProgressBar.value = 100;
+
+        if (type === QUEUE_EVENTS.QUEUE_COMPLETED_WITH_ERRORS) {
+            const warning = getAll404SessionWarning(snapshot, type);
+            if (warning) {
+                showFeedback(materialsErrorEl, warning, true);
+            }
+        }
+    }
+}
+
 function resetCourseAndMaterials(summaryText = "Open Course Page Consolidated and click Refresh & Scan Course.") {
     state.extraction = null;
+    state.itemStatusEls.clear();
     courseNameEl.textContent = "No course detected";
     courseCodeEl.textContent = "Waiting for VTOP course page";
     materialsBadgeEl.textContent = "0";
@@ -59,6 +263,8 @@ function resetCourseAndMaterials(summaryText = "Open Course Page Consolidated an
     hideElement(materialsErrorEl);
     materialsListEl.innerHTML = "";
     materialsListEl.classList.add("hidden");
+    queueProgressBox.classList.add("hidden");
+    updateDownloadControlState();
 }
 
 function renderFolderState() {
@@ -66,7 +272,7 @@ function renderFolderState() {
         folderNameEl.textContent = "No folder selected";
         folderStatusEl.textContent = "Choose a folder to store course materials.";
         reauthorizeFolderButton.classList.add("hidden");
-        testFileButton.disabled = true;
+        updateDownloadControlState();
         return;
     }
 
@@ -75,20 +281,19 @@ function renderFolderState() {
     if (state.dirPermission === "granted") {
         folderStatusEl.textContent = "Write access granted (persisted in IndexedDB).";
         reauthorizeFolderButton.classList.add("hidden");
-        testFileButton.disabled = false;
     } else if (state.dirPermission === "prompt") {
         folderStatusEl.textContent = "Saved folder requires re-authorization after reload.";
         reauthorizeFolderButton.classList.remove("hidden");
-        testFileButton.disabled = true;
     } else {
         folderStatusEl.textContent = "Folder permission denied. Please choose a folder again.";
         reauthorizeFolderButton.classList.add("hidden");
-        testFileButton.disabled = true;
     }
+    updateDownloadControlState();
 }
 
 function renderMaterials(extraction) {
     state.extraction = extraction;
+    state.itemStatusEls.clear();
 
     const course = extraction.course || {};
     courseNameEl.textContent = course.courseName || "Unknown Course";
@@ -115,6 +320,7 @@ function renderMaterials(extraction) {
     materialsListEl.innerHTML = "";
     if (materials.length === 0) {
         materialsListEl.classList.add("hidden");
+        updateDownloadControlState();
         return;
     }
 
@@ -136,6 +342,9 @@ function renderMaterials(extraction) {
         const fileTag = document.createElement("span");
         fileTag.className = "file-id-tag";
         fileTag.textContent = item.hasValidFileId ? `ID: ${item.fileId}` : "No ID";
+        if (item.hasValidFileId && !state.itemStatusEls.has(item.fileId)) {
+            state.itemStatusEls.set(item.fileId, fileTag);
+        }
 
         meta.append(faculty, fileTag);
         li.append(title, meta);
@@ -144,6 +353,7 @@ function renderMaterials(extraction) {
 
     materialsListEl.appendChild(fragment);
     materialsListEl.classList.remove("hidden");
+    updateDownloadControlState();
 }
 
 async function ensureContentScriptsInjected(tabId) {
@@ -174,6 +384,10 @@ async function sendTabMessageWithRecovery(tabId, message) {
 }
 
 async function checkCurrentWebsite() {
+    if (state.queueRunning) {
+        return;
+    }
+
     statusTitle.textContent = "Checking...";
     statusDescription.textContent = "Reading current browser tab.";
     hideElement(materialsErrorEl);
@@ -288,6 +502,28 @@ async function restoreSavedDirectory() {
     }
 }
 
+async function restoreOrganizationMode() {
+    try {
+        if (!chrome?.storage?.local) {
+            return;
+        }
+        const stored = await chrome.storage.local.get(ORG_MODE_STORAGE_KEY);
+        const mode = stored?.[ORG_MODE_STORAGE_KEY];
+        if (mode === ORGANIZATION_MODES.COURSE_FACULTY || mode === ORGANIZATION_MODES.COURSE_ONLY) {
+            organizationModeSelect.value = mode;
+        }
+    } catch {
+        // Ignore storage read errors and retain default mode
+    }
+}
+
+organizationModeSelect.addEventListener("change", () => {
+    const mode = organizationModeSelect.value;
+    if (chrome?.storage?.local) {
+        chrome.storage.local.set({ [ORG_MODE_STORAGE_KEY]: mode }).catch(() => {});
+    }
+});
+
 // Keep showDirectoryPicker() synchronous inside click handler before any await
 chooseFolderButton.addEventListener("click", () => {
     hideElement(fsFeedbackEl);
@@ -356,11 +592,47 @@ testFileButton.addEventListener("click", async () => {
     }
 });
 
+startDownloadButton.addEventListener("click", async () => {
+    if (state.queueRunning || !state.extraction?.ok || !state.dirHandle) {
+        return;
+    }
+    hideElement(materialsErrorEl);
+
+    const organizationMode =
+        organizationModeSelect.value === ORGANIZATION_MODES.COURSE_ONLY
+            ? ORGANIZATION_MODES.COURSE_ONLY
+            : ORGANIZATION_MODES.COURSE_FACULTY;
+
+    const loadRes = queueManager.loadQueue(state.extraction.materials, {
+        course: state.extraction.course,
+        organizationMode,
+        formAction: state.extraction.formAction,
+        formEntries: state.extraction.formEntries
+    });
+
+    if (!loadRes.ok) {
+        showFeedback(materialsErrorEl, loadRes.error || "Unable to prepare download queue.", true);
+        return;
+    }
+
+    renderQueueSnapshotProgress(loadRes.snapshot);
+    try {
+        const runRes = await queueManager.start();
+        if (!runRes.ok) {
+            showFeedback(materialsErrorEl, runRes.error || "Download queue stopped due to an error.", true);
+        }
+    } finally {
+        state.queueRunning = false;
+        updateDownloadControlState();
+    }
+});
+
 refreshButton.addEventListener("click", checkCurrentWebsite);
 
 chrome.tabs.onActivated.addListener(() => {
     checkCurrentWebsite();
 });
 
+restoreOrganizationMode();
 restoreSavedDirectory();
 checkCurrentWebsite();
