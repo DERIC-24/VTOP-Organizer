@@ -4,6 +4,28 @@
     const ALLOWED_ORIGIN = "https://vtop.vit.ac.in";
     const FILE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
     const COURSE_CODE_PATTERN = /\b([A-Z]{2,5}\d{3,4}[A-Z]?)\b/;
+    const EMBEDDED_COURSE_TYPES = new Set(["ETH", "ELA", "EPJ"]);
+    const COURSE_TYPE_LABELS = Object.freeze({
+        ETH: "Embedded Theory",
+        ELA: "Embedded Lab",
+        EPJ: "Embedded Project",
+        TH: "Theory Only",
+        LO: "Lab Only",
+        SS: "Soft Skill"
+    });
+
+    function formatCourseType(typeCode, rawLabel = "") {
+        const normalizedCode = sanitizeString(typeCode || "", 16).toUpperCase();
+        if (!normalizedCode) {
+            return "";
+        }
+        const canonicalLabel = COURSE_TYPE_LABELS[normalizedCode] || "";
+        const cleanedLabel = sanitizeString(rawLabel || "", 80)
+            .replace(/\s*[-–—]\s*\d+(?:\.\d+)?\s*$/, "")
+            .trim();
+        const label = canonicalLabel || (!/^\d+(?:\.\d+)?$/.test(cleanedLabel) ? cleanedLabel : "");
+        return label ? `${normalizedCode} - ${label}` : normalizedCode;
+    }
 
     function sanitizeString(value, maxLength = 300, preserveNewlines = false) {
         if (typeof value !== "string") {
@@ -34,16 +56,35 @@
 
         for (const line of lines) {
             // Pattern: "Fall Semester 2026-27 - BAECE202 - Engineering Electromagnetics - TH - Theory Only - 4.0"
-            // or "BAECE202 - Engineering Electromagnetics - TH"
-            const codeMatch = line.match(/\b([A-Z]{2,5}\d{3,4}[A-Z]?)\s*[-–:|]\s*(.+)/);
+            // or "BAECE203 — Analog Electronics — ETH — Embedded Theory"
+            const codeMatch = line.match(/\b([A-Z]{2,5}\d{3,4}[A-Z]?)\s*[-–—:|]\s*(.+)/);
             if (codeMatch) {
                 const courseCode = codeMatch[1].trim();
                 let rest = codeMatch[2].trim();
-                // Strip trailing VTOP metadata segments like " - TH - Theory Only - 4.0" or " - TH"
-                rest = rest.replace(/\s*-\s*(?:TH|LO|ETH|ELA|EPJ|SS)\b(?:\s*-\s*.*)?$/i, "").trim();
+                const typeMatch = rest.match(
+                    /\s*[-–—]\s*(TH|LO|ETH|ELA|EPJ|SS)\b(?:\s*[-–—]\s*(.*))?$/i
+                );
+                let courseTypeCode = "";
+                let courseTypeLabel = "";
+                let courseType = "";
+
+                if (typeMatch) {
+                    courseTypeCode = typeMatch[1].toUpperCase();
+                    const formattedType = formatCourseType(courseTypeCode, typeMatch[2] || "");
+                    const dashIdx = formattedType.indexOf(" - ");
+                    courseTypeLabel = dashIdx >= 0 ? formattedType.slice(dashIdx + 3) : "";
+                    if (EMBEDDED_COURSE_TYPES.has(courseTypeCode)) {
+                        courseType = formattedType;
+                    }
+                    rest = rest.slice(0, typeMatch.index).trim();
+                }
+
                 return {
                     courseCode,
                     courseName: sanitizeString(rest || codeMatch[2], 140),
+                    courseTypeCode,
+                    courseTypeLabel,
+                    courseType,
                     rawTitle: line
                 };
             }
@@ -55,11 +96,36 @@
             return {
                 courseCode: fallbackCode[1],
                 courseName: joined,
+                courseTypeCode: "",
+                courseTypeLabel: "",
+                courseType: "",
                 rawTitle: joined
             };
         }
 
         return null;
+    }
+
+    function hasSiblingCourseTypes(courseSelect, targetCourseCode, targetTypeCode) {
+        if (!courseSelect || !targetCourseCode || !targetTypeCode) {
+            return false;
+        }
+        const options = Array.from(courseSelect.options || []);
+        const seenTypes = new Set([targetTypeCode]);
+        for (const option of options) {
+            const text = option?.textContent || "";
+            if (!text) {
+                continue;
+            }
+            const parsed = parseCourseTitle(text);
+            if (parsed && parsed.courseCode === targetCourseCode && parsed.courseTypeCode) {
+                seenTypes.add(parsed.courseTypeCode);
+                if (seenTypes.size > 1) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     function extractCourseInfo(materials = []) {
@@ -72,6 +138,13 @@
             if (selectedOption?.textContent) {
                 const parsed = parseCourseTitle(selectedOption.textContent);
                 if (parsed) {
+                    if (
+                        !parsed.courseType &&
+                        parsed.courseTypeCode &&
+                        hasSiblingCourseTypes(courseSelect, parsed.courseCode, parsed.courseTypeCode)
+                    ) {
+                        parsed.courseType = formatCourseType(parsed.courseTypeCode, parsed.courseTypeLabel);
+                    }
                     return parsed;
                 }
             }
@@ -112,6 +185,9 @@
         return {
             courseCode: "",
             courseName: "Unknown Course",
+            courseTypeCode: "",
+            courseTypeLabel: "",
+            courseType: "",
             rawTitle: "Unknown Course"
         };
     }
@@ -283,11 +359,17 @@
         const component =
             sanitizeString(pickCell(columnMap.component, -1), 40) ||
             (componentMatch ? componentMatch[1].toUpperCase() : "");
+        const normalizedComponent = component.toUpperCase();
+        const courseType = EMBEDDED_COURSE_TYPES.has(normalizedComponent)
+            ? formatCourseType(normalizedComponent)
+            : "";
 
         return {
             rowNumber,
             courseDetail,
             component,
+            courseTypeCode: normalizedComponent,
+            courseType,
             topic,
             uploadedBy: parsedFaculty.uploadedBy,
             uploadedDate: explicitDate || parsedFaculty.uploadedDate,
@@ -393,6 +475,14 @@
         });
 
         const course = extractCourseInfo(materials);
+        for (const material of materials) {
+            if (!material.courseType && course.courseType) {
+                material.courseType = course.courseType;
+            }
+            if (!material.courseTypeCode && course.courseTypeCode) {
+                material.courseTypeCode = course.courseTypeCode;
+            }
+        }
         const formMeta = extractDownloadFormMetadata();
 
         return {

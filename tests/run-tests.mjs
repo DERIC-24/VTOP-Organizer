@@ -1,6 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
@@ -14,9 +13,19 @@ import {
 import {
     buildCourseFolderName,
     buildTargetFolderSegments,
+    formatCourseTypeFolderSegment,
     resolveUniqueFilename,
     sanitizePathSegment
 } from "../utils/folder-organizer.js";
+import {
+    buildAllDownloadPayload,
+    buildSelectedDownloadPayload,
+    countSelectedMaterials,
+    deselectAllMaterials,
+    prepareSelectableMaterials,
+    selectAllMaterials,
+    toggleMaterialSelection
+} from "../utils/material-selection.js";
 import {
     buildFormBody,
     buildProgressState,
@@ -26,8 +35,7 @@ import {
     validateDownloadedBinary
 } from "../services/download-service.js";
 import {
-    buildValidSamplePdfBytes,
-    createStage2TestFile,
+    ensureSubdirectory,
     loadDirectoryHandle,
     pickAndSaveDirectory,
     requestDirectoryPermission,
@@ -57,9 +65,11 @@ import {
 } from "../services/download-errors.js";
 import {
     ALL_404_SESSION_WARNING,
+    AUTH_EXPIRED_SESSION_WARNING,
     createFileSystemSaveAdapter,
     DownloadQueueManager,
     getAll404SessionWarning,
+    getAuthExpiredWarning,
     ORGANIZATION_MODES,
     QUEUE_EVENTS
 } from "../services/queue-manager.js";
@@ -588,7 +598,7 @@ test("Re-injecting bridge scripts replaces old listeners cleanly without duplica
     assert.equal(extraction.stats.totalRows, 100);
 });
 
-test("file-system service persists directory handles in IndexedDB and writes non-overwriting test files", async () => {
+test("file-system service persists directory handles in IndexedDB, creates nested subdirectories, and writes non-overwriting binary files", async () => {
     const stores = new Map();
     globalThis.indexedDB = {
         open: () => {
@@ -695,135 +705,24 @@ test("file-system service persists directory handles in IndexedDB and writes non
     assert.equal(await verifyDirectoryPermission(restored), "prompt");
     assert.equal(await requestDirectoryPermission(restored), "granted");
 
-    const first = await createStage2TestFile(restored);
-    assert.equal(first.fileName, "stage2-fsa-test.pdf");
-    assert.ok(first.size > 0);
+    const nestedDir = await ensureSubdirectory(restored, [
+        "BAECE203 - Analog Electronics",
+        "ETH - Embedded Theory",
+        "FACULTY ONE"
+    ]);
+    const payload = new Uint8Array([0x50, 0x4b, 0x03, 0x04]);
+    const first = await writeBinaryFile(nestedDir, "RG1.pptx", payload);
+    assert.equal(first.filename, "RG1.pptx");
+    assert.equal(first.size, 4);
 
-    const second = await createStage2TestFile(restored);
-    assert.equal(second.fileName, "stage2-fsa-test (1).pdf");
+    const second = await writeBinaryFile(nestedDir, "RG1.pptx", payload);
+    assert.equal(second.filename, "RG1 (1).pptx");
+    assert.equal(second.size, 4);
 
-    const customDir = await restored.getDirectoryHandle("Custom", { create: true });
-    const written = await writeBinaryFile(customDir, "RG1.pptx", new Uint8Array([0x50, 0x4b, 0x03, 0x04]));
-    assert.equal(written.filename, "RG1.pptx");
-    assert.equal(written.size, 4);
-
-    // Verify the exact file written by createStage2TestFile() is structurally valid PDF
-    const testSubdir = await restored.getDirectoryHandle("VTOP-Organizer-Test", { create: false });
-    const testFileHandle = await testSubdir.getFileHandle("stage2-fsa-test.pdf");
-    const writtenPdfBytes = new Uint8Array(await (await testFileHandle.getFile()).arrayBuffer());
-    assert.deepEqual(writtenPdfBytes, buildValidSamplePdfBytes());
+    const writtenHandle = await nestedDir.getFileHandle("RG1.pptx");
+    const writtenBytes = new Uint8Array(await (await writtenHandle.getFile()).arrayBuffer());
+    assert.deepEqual(writtenBytes, payload);
 });
-
-test("createStage2TestFile produces a spec-compliant PDF 1.4 parseable via xref and trailer", () => {
-    const pdfBytes = buildValidSamplePdfBytes();
-    const pdfText = Buffer.from(pdfBytes).toString("latin1");
-
-    assert.ok(pdfText.startsWith("%PDF-1.4\n"));
-    assert.ok(pdfText.trimEnd().endsWith("%%EOF"));
-
-    const startxrefMatch = pdfText.match(/startxref\n(\d+)\n%%EOF\s*$/);
-    assert.ok(startxrefMatch, "PDF must end with startxref <offset> %%EOF");
-    const xrefOffset = Number.parseInt(startxrefMatch[1], 10);
-
-    // Cross-reference table must begin exactly at xrefOffset
-    assert.equal(pdfText.slice(xrefOffset, xrefOffset + 5), "xref\n");
-
-    const xrefSection = pdfText.slice(xrefOffset);
-    const xrefHeaderMatch = xrefSection.match(/^xref\n0 (\d+)\n/);
-    assert.ok(xrefHeaderMatch, "xref subsection header '0 N' must exist");
-    const objectCount = Number.parseInt(xrefHeaderMatch[1], 10);
-    assert.equal(objectCount, 6);
-
-    const entriesStart = xrefOffset + xrefHeaderMatch[0].length;
-    const entries = [];
-    for (let i = 0; i < objectCount; i += 1) {
-        const entry = pdfText.slice(entriesStart + i * 20, entriesStart + (i + 1) * 20);
-        assert.equal(entry.length, 20, `xref entry ${i} must be exactly 20 bytes`);
-        const match = entry.match(/^(\d{10}) (\d{5}) ([fn]) \n$/);
-        assert.ok(match, `xref entry ${i} invalid format: ${JSON.stringify(entry)}`);
-        entries.push({
-            offset: Number.parseInt(match[1], 10),
-            generation: Number.parseInt(match[2], 10),
-            inUse: match[3] === "n"
-        });
-    }
-
-    assert.equal(entries[0].inUse, false);
-    assert.equal(entries[0].generation, 65535);
-
-    const parsedObjects = new Map();
-    for (let objNum = 1; objNum < objectCount; objNum += 1) {
-        assert.equal(entries[objNum].inUse, true);
-        const objSlice = pdfText.slice(entries[objNum].offset);
-        assert.ok(
-            objSlice.startsWith(`${objNum} 0 obj\n`),
-            `Object ${objNum} must begin at exact xref offset ${entries[objNum].offset}`
-        );
-        const endIdx = objSlice.indexOf("\nendobj\n");
-        assert.ok(endIdx > 0, `Object ${objNum} must terminate with endobj`);
-        parsedObjects.set(objNum, objSlice.slice(0, endIdx));
-    }
-
-    // Verify Trailer, Catalog, Pages, Page, Content Stream /Length, and Font
-    const trailerMatch = xrefSection.match(/trailer\n<<\s*\/Size 6\s+\/Root 1 0 R\s*>>/);
-    assert.ok(trailerMatch, "Trailer must declare /Size 6 and /Root 1 0 R");
-
-    assert.match(parsedObjects.get(1), /\/Type\s+\/Catalog\b/);
-    assert.match(parsedObjects.get(1), /\/Pages\s+2 0 R\b/);
-
-    assert.match(parsedObjects.get(2), /\/Type\s+\/Pages\b/);
-    assert.match(parsedObjects.get(2), /\/Kids\s+\[3 0 R\]/);
-    assert.match(parsedObjects.get(2), /\/Count\s+1\b/);
-
-    assert.match(parsedObjects.get(3), /\/Type\s+\/Page\b/);
-    assert.match(parsedObjects.get(3), /\/Parent\s+2 0 R\b/);
-    assert.match(parsedObjects.get(3), /\/MediaBox\s+\[0 0 612 792\]/);
-    assert.match(parsedObjects.get(3), /\/Contents\s+4 0 R\b/);
-
-    const obj4 = parsedObjects.get(4);
-    const lengthMatch = obj4.match(/\/Length\s+(\d+)/);
-    assert.ok(lengthMatch, "Content stream object 4 must specify /Length");
-    const declaredLen = Number.parseInt(lengthMatch[1], 10);
-    const streamStart = obj4.indexOf("stream\n") + "stream\n".length;
-    const streamEnd = obj4.lastIndexOf("\nendstream");
-    assert.ok(streamStart > 0 && streamEnd > streamStart);
-    const actualStreamBytes = Buffer.byteLength(obj4.slice(streamStart, streamEnd), "latin1");
-    assert.equal(actualStreamBytes, declaredLen);
-    assert.ok(obj4.includes("VTOP Organizer - File System Access API Verified"));
-
-    assert.match(parsedObjects.get(5), /\/Type\s+\/Font\b/);
-    assert.match(parsedObjects.get(5), /\/Subtype\s+\/Type1\b/);
-    assert.match(parsedObjects.get(5), /\/BaseFont\s+\/Helvetica\b/);
-});
-
-test(
-    "Windows native PdfDocument reader loads and parses the generated PDF",
-    { skip: process.platform !== "win32" },
-    () => {
-        const pdfBase64 = Buffer.from(buildValidSamplePdfBytes()).toString("base64");
-        const psScript = [
-            "Add-Type -AssemblyName System.Runtime.WindowsRuntime",
-            "[Windows.Data.Pdf.PdfDocument,Windows.Data.Pdf,ContentType=WindowsRuntime] | Out-Null",
-            "$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]",
-            "function Await-WinRT($op, $type) { $m = $asTask.MakeGenericMethod($type); $t = $m.Invoke($null, @($op)); $t.Wait(); return $t.Result }",
-            "$b64 = [Console]::In.ReadToEnd().Trim()",
-            "$bytes = [Convert]::FromBase64String($b64)",
-            "$mem = New-Object System.IO.MemoryStream(,$bytes)",
-            "$stream = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($mem)",
-            "$pdf = Await-WinRT ([Windows.Data.Pdf.PdfDocument]::LoadFromStreamAsync($stream)) ([Windows.Data.Pdf.PdfDocument])",
-            "$page = $pdf.GetPage(0)",
-            'Write-Output ("PageCount={0};Width={1};Height={2};Protected={3}" -f $pdf.PageCount, $page.Size.Width, $page.Size.Height, $pdf.IsPasswordProtected)'
-        ].join("; ");
-
-        const output = execFileSync(
-            "powershell",
-            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psScript],
-            { input: pdfBase64, encoding: "utf8" }
-        ).trim();
-
-        assert.equal(output, "PageCount=1;Width=816;Height=1056;Protected=False");
-    }
-);
 
 test("Stage 3A state machine enforces valid and invalid material/queue transitions", () => {
     // Valid material transitions
@@ -2153,4 +2052,745 @@ test("Stage 3B 404 disambiguation detects login redirects/HTML markers safely, b
     } finally {
         globalThis.fetch = originalFetch;
     }
+});
+
+test("Stage 3C pause aborts active transfer without triggering retry, resume restarts interrupted file, and progress/sequentiality hold", async () => {
+    const originalFetch = globalThis.fetch;
+    const pdfPayload = new TextEncoder().encode("%PDF-1.4\nResumed stream body");
+    const fetchCalls = [];
+    const abortedSignals = [];
+    let activeFetches = 0;
+    let maxConcurrentFetches = 0;
+    let resolveF2Started = null;
+    const f2StartedPromise = new Promise((r) => {
+        resolveF2Started = r;
+    });
+    let releaseF2Stream = null;
+    let f2FirstAttempt = true;
+
+    globalThis.fetch = async (_url, init) => {
+        activeFetches += 1;
+        maxConcurrentFetches = Math.max(maxConcurrentFetches, activeFetches);
+        const fileId = init.body.get("fileId");
+        fetchCalls.push(fileId);
+
+        try {
+            assert.ok(init.signal instanceof AbortSignal);
+
+            if (fileId === "F2" && f2FirstAttempt) {
+                f2FirstAttempt = false;
+                init.signal.addEventListener("abort", () => {
+                    abortedSignals.push({ fileId, reason: init.signal.reason });
+                });
+
+                const stalledStream = new ReadableStream({
+                    start(controller) {
+                        controller.enqueue(pdfPayload.slice(0, 6));
+                        resolveF2Started();
+                    },
+                    pull() {
+                        return new Promise((resolve) => {
+                            releaseF2Stream = resolve;
+                        });
+                    },
+                    cancel() {
+                        releaseF2Stream?.();
+                    }
+                });
+
+                return new Response(stalledStream, {
+                    status: 200,
+                    headers: {
+                        "content-type": "application/pdf",
+                        "content-length": String(pdfPayload.byteLength),
+                        "content-disposition": 'attachment; filename="F2.pdf"'
+                    }
+                });
+            }
+
+            return new Response(createChunkedStream([pdfPayload.slice(0, 10), pdfPayload.slice(10)]), {
+                status: 200,
+                headers: {
+                    "content-type": "application/pdf",
+                    "content-length": String(pdfPayload.byteLength),
+                    "content-disposition": `attachment; filename="${fileId}.pdf"`
+                }
+            });
+        } finally {
+            activeFetches -= 1;
+        }
+    };
+
+    try {
+        const events = [];
+        const savedFiles = [];
+        const manager = new DownloadQueueManager({
+            delayFn: async () => {},
+            downloadMaterial,
+            saveMaterial: async ({ material, downloadResult }) => {
+                savedFiles.push(material.fileId);
+                return {
+                    filename: downloadResult.cleanFilename,
+                    size: downloadResult.byteLength,
+                    path: `Root/${downloadResult.cleanFilename}`
+                };
+            },
+            onEvent: (evt) => events.push(evt)
+        });
+
+        manager.loadQueue(
+            [
+                { id: "i-1", fileId: "F1", topic: "File 1" },
+                { id: "i-2", fileId: "F2", topic: "File 2" },
+                { id: "i-3", fileId: "F3", topic: "File 3" }
+            ],
+            {
+                course: { courseCode: "BAECE203", courseName: "Analog Electronics" },
+                organizationMode: ORGANIZATION_MODES.COURSE_ONLY,
+                formAction: "https://vtop.vit.ac.in/vtop/downloadCourseMaterialFacultyPdf",
+                formEntries: [["_csrf", "secret-csrf-3c"], ["authorizedID", "SECRET_ID_3C"]]
+            }
+        );
+
+        const startPromise = manager.start();
+        await f2StartedPromise;
+
+        const pauseRes = await manager.pause();
+        assert.equal(pauseRes.ok, true);
+        assert.equal(pauseRes.snapshot.queueState, QUEUE_STATES.PAUSED);
+        assert.equal(pauseRes.snapshot.canResume, true);
+        assert.equal(pauseRes.snapshot.canPause, false);
+        assert.equal(pauseRes.snapshot.completed, 1);
+        assert.equal(pauseRes.snapshot.pending, 2);
+        assert.equal(pauseRes.snapshot.downloading, 0);
+        assert.equal(pauseRes.snapshot.retrying, 0);
+
+        // Active transfer aborted intentionally by pause; no automatic retry triggered
+        assert.equal(abortedSignals.length, 1);
+        assert.equal(abortedSignals[0].fileId, "F2");
+        assert.equal(abortedSignals[0].reason.abortReason, ABORT_REASONS.PAUSE);
+        assert.equal(
+            events.some((e) => e.type === QUEUE_EVENTS.MATERIAL_ATTEMPT_FAILED && e.fileId === "F2"),
+            false
+        );
+        assert.equal(
+            events.some((e) => e.type === QUEUE_EVENTS.MATERIAL_STATE_CHANGED && e.state === MATERIAL_STATES.RETRYING),
+            false
+        );
+
+        // Duplicate pause while already paused is safely rejected
+        const doublePause = await manager.pause();
+        assert.equal(doublePause.ok, false);
+        assert.equal(doublePause.code, "QUEUE_ALREADY_PAUSED");
+
+        // Snapshot immutability check while paused
+        assert.equal(Object.isFrozen(pauseRes.snapshot), true);
+        assert.equal(Object.isFrozen(pauseRes.snapshot.items), true);
+        assert.equal(Object.isFrozen(pauseRes.snapshot.items[0]), true);
+
+        const resumeRes = await manager.resume();
+        const startRes = await startPromise;
+
+        assert.equal(resumeRes.ok, true);
+        assert.equal(startRes.ok, true);
+        assert.equal(startRes.snapshot.queueState, QUEUE_STATES.COMPLETED);
+        assert.equal(startRes.snapshot.completed, 3);
+        assert.equal(maxConcurrentFetches, 1);
+
+        // F1 never re-downloaded; F2 restarted from beginning; F3 downloaded once
+        assert.deepEqual(fetchCalls, ["F1", "F2", "F2", "F3"]);
+        assert.deepEqual(savedFiles, ["F1", "F2", "F3"]);
+
+        // Verify queue state transitions running -> paused -> running -> completed
+        const queueStateSequence = events.map((e) => e.snapshot.queueState);
+        assert.ok(queueStateSequence.includes(QUEUE_STATES.RUNNING));
+        assert.ok(queueStateSequence.includes(QUEUE_STATES.PAUSED));
+        assert.equal(events.some((e) => e.type === QUEUE_EVENTS.QUEUE_PAUSED), true);
+        assert.equal(events.some((e) => e.type === QUEUE_EVENTS.QUEUE_RESUMED), true);
+        assert.equal(queueStateSequence[queueStateSequence.length - 1], QUEUE_STATES.COMPLETED);
+
+        // Progress events continued working after resume for F2
+        const f2ProgressAfterResume = events.filter(
+            (e) =>
+                e.type === QUEUE_EVENTS.MATERIAL_PROGRESS &&
+                e.fileId === "F2" &&
+                e.progress.percent === 100
+        );
+        assert.equal(f2ProgressAfterResume.length, 1);
+
+        // Secrets never leak into snapshots or events
+        const serialized = JSON.stringify({ snapshot: startRes.snapshot, events });
+        assert.equal(serialized.includes("secret-csrf-3c"), false);
+        assert.equal(serialized.includes("SECRET_ID_3C"), false);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("Stage 3C pause between files (during save) and cancel during active transfer and while paused", async () => {
+    // 1. Pause between files during saveMaterial
+    let releaseSave1 = null;
+    const save1Entered = new Promise((r) => {
+        // resolved inside saveMaterial
+    });
+    let notifySave1Entered = null;
+    const waitSave1 = new Promise((r) => {
+        notifySave1Entered = r;
+    });
+    const downloadedOrder = [];
+
+    const betweenPauseManager = new DownloadQueueManager({
+        delayFn: async () => {},
+        downloadMaterial: async ({ fileId }) => {
+            downloadedOrder.push(fileId);
+            return {
+                buffer: new Uint8Array([0x25, 0x50, 0x44, 0x46]).buffer,
+                rawFilename: `${fileId}.pdf`,
+                cleanFilename: `${fileId}.pdf`,
+                contentType: "application/pdf",
+                byteLength: 4
+            };
+        },
+        saveMaterial: async ({ material, downloadResult }) => {
+            if (material.fileId === "B1") {
+                notifySave1Entered();
+                await new Promise((resolve) => {
+                    releaseSave1 = resolve;
+                });
+            }
+            return {
+                filename: downloadResult.cleanFilename,
+                size: 4,
+                path: `Root/${downloadResult.cleanFilename}`
+            };
+        }
+    });
+
+    betweenPauseManager.loadQueue([{ fileId: "B1" }, { fileId: "B2" }]);
+    const betweenStart = betweenPauseManager.start();
+    await waitSave1;
+    const betweenPause = betweenPauseManager.pause();
+    releaseSave1();
+    const pausedSnap = await betweenPause;
+
+    assert.equal(pausedSnap.ok, true);
+    assert.equal(pausedSnap.snapshot.queueState, QUEUE_STATES.PAUSED);
+    assert.equal(pausedSnap.snapshot.completed, 1);
+    assert.equal(pausedSnap.snapshot.pending, 1);
+    assert.deepEqual(downloadedOrder, ["B1"]);
+
+    // Cancel while paused -> remaining pending item marked cancelled; completed stays completed
+    const cancelledFromPause = await betweenPauseManager.cancel();
+    await betweenStart;
+    assert.equal(cancelledFromPause.ok, true);
+    assert.equal(cancelledFromPause.snapshot.queueState, QUEUE_STATES.COMPLETED_WITH_ERRORS);
+    assert.equal(cancelledFromPause.snapshot.completed, 1);
+    assert.equal(cancelledFromPause.snapshot.cancelled, 1);
+    assert.equal(cancelledFromPause.snapshot.items[0].state, MATERIAL_STATES.COMPLETED);
+    assert.equal(cancelledFromPause.snapshot.items[1].state, MATERIAL_STATES.CANCELLED);
+    assert.deepEqual(downloadedOrder, ["B1"]);
+
+    // Cancelled queue cannot restart accidentally
+    const restartCancelled = await betweenPauseManager.start();
+    assert.equal(restartCancelled.ok, false);
+    assert.equal(restartCancelled.code, "INVALID_QUEUE_STATE");
+    const retryCancelled = await betweenPauseManager.retryFailed();
+    assert.equal(retryCancelled.ok, false);
+    assert.equal(retryCancelled.code, "NO_FAILED_MATERIALS");
+
+    // 2. Cancel during active network transfer aborts request and prevents pending transfers
+    let c2Aborted = false;
+    let notifyC2Started = null;
+    const waitC2 = new Promise((r) => {
+        notifyC2Started = r;
+    });
+    const activeDownloads = [];
+    const activeEvents = [];
+
+    const cancelActiveManager = new DownloadQueueManager({
+        delayFn: async () => {},
+        onEvent: (evt) => activeEvents.push(evt),
+        downloadMaterial: async ({ fileId, signal }) => {
+            activeDownloads.push(fileId);
+            if (fileId === "C2") {
+                notifyC2Started();
+                await new Promise((_, reject) => {
+                    signal.addEventListener(
+                        "abort",
+                        () => {
+                            c2Aborted = true;
+                            reject(signal.reason);
+                        },
+                        { once: true }
+                    );
+                });
+            }
+            return {
+                buffer: new Uint8Array([0x25, 0x50, 0x44, 0x46]).buffer,
+                rawFilename: `${fileId}.pdf`,
+                cleanFilename: `${fileId}.pdf`,
+                contentType: "application/pdf",
+                byteLength: 4
+            };
+        },
+        saveMaterial: async ({ downloadResult }) => ({
+            filename: downloadResult.cleanFilename,
+            size: 4,
+            path: `Root/${downloadResult.cleanFilename}`
+        })
+    });
+
+    cancelActiveManager.loadQueue([{ fileId: "C1" }, { fileId: "C2" }, { fileId: "C3" }]);
+    const cancelStartPromise = cancelActiveManager.start();
+    await waitC2;
+    const cancelResult = await cancelActiveManager.cancel();
+    const cancelStartDone = await cancelStartPromise;
+
+    assert.equal(c2Aborted, true);
+    assert.equal(cancelResult.ok, true);
+    assert.equal(cancelStartDone.snapshot.queueState, QUEUE_STATES.COMPLETED_WITH_ERRORS);
+    assert.deepEqual(activeDownloads, ["C1", "C2"]);
+    assert.equal(cancelStartDone.snapshot.completed, 1);
+    assert.equal(cancelStartDone.snapshot.cancelled, 2);
+    assert.equal(cancelStartDone.snapshot.items[0].state, MATERIAL_STATES.COMPLETED);
+    assert.equal(cancelStartDone.snapshot.items[1].state, MATERIAL_STATES.CANCELLED);
+    assert.equal(cancelStartDone.snapshot.items[2].state, MATERIAL_STATES.CANCELLED);
+    assert.equal(activeEvents.some((e) => e.type === QUEUE_EVENTS.QUEUE_CANCELLED), true);
+    assert.equal(
+        activeEvents.some((e) => e.type === QUEUE_EVENTS.MATERIAL_STATE_CHANGED && e.state === MATERIAL_STATES.RETRYING),
+        false
+    );
+});
+
+test("Stage 3C manual retry processes failed items only, preserves metadata/courseType, distinguishes retry cycles, and surfaces auth expiry guidance", async () => {
+    const attemptHistory = [];
+    const savedPaths = [];
+    const events = [];
+    let activeCount = 0;
+    let maxConcurrency = 0;
+    let shouldFailNetOnce = true;
+    let shouldRecover503 = false;
+
+    const manager = new DownloadQueueManager({
+        delayFn: async () => {},
+        onEvent: (evt) => events.push(evt),
+        downloadMaterial: async ({ fileId }) => {
+            activeCount += 1;
+            maxConcurrency = Math.max(maxConcurrency, activeCount);
+            attemptHistory.push(fileId);
+            try {
+                if (fileId === "R_OK") {
+                    // succeeds
+                } else if (fileId === "R_RETRY_503") {
+                    if (!shouldRecover503) {
+                        throw { status: 503, message: "Temporary outage" };
+                    }
+                    if (shouldFailNetOnce) {
+                        shouldFailNetOnce = false;
+                        throw new TypeError("Failed to fetch");
+                    }
+                } else if (fileId === "R_AUTH") {
+                    throw new DownloadError("SESSION_EXPIRED", "VTOP session expired", 401);
+                } else if (fileId === "R_FS_FAIL") {
+                    // download succeeds, saveMaterial throws
+                }
+                return {
+                    buffer: new Uint8Array([0x25, 0x50, 0x44, 0x46]).buffer,
+                    rawFilename: `${fileId}.pdf`,
+                    cleanFilename: `${fileId}.pdf`,
+                    contentType: "application/pdf",
+                    byteLength: 4
+                };
+            } finally {
+                activeCount -= 1;
+            }
+        },
+        saveMaterial: async ({ material, downloadResult, folderSegments }) => {
+            if (material.fileId === "R_FS_FAIL" && material.manualRetryCount === 0) {
+                const err = new Error("Permission denied");
+                err.name = "NotAllowedError";
+                throw err;
+            }
+            savedPaths.push(`${folderSegments.join("/")}/${downloadResult.cleanFilename}`);
+            return {
+                filename: downloadResult.cleanFilename,
+                size: 4,
+                path: `Root/${folderSegments.join("/")}/${downloadResult.cleanFilename}`
+            };
+        }
+    });
+
+    manager.loadQueue(
+        [
+            { id: "m1", fileId: "R_OK", topic: "OK Item", uploadedBy: "FACULTY ONE" },
+            { id: "m2", fileId: "R_RETRY_503", topic: "Retryable 503", uploadedBy: "FACULTY ONE" },
+            { id: "m3", fileId: "R_AUTH", topic: "Auth Fail", uploadedBy: "FACULTY ONE" },
+            { id: "m4", fileId: "R_FS_FAIL", topic: "FS Fail", uploadedBy: "FACULTY ONE" }
+        ],
+        {
+            course: {
+                courseCode: "BAECE203",
+                courseName: "Analog Electronics",
+                courseType: "ETH - Embedded Theory"
+            },
+            organizationMode: ORGANIZATION_MODES.COURSE_FACULTY,
+            formAction: "https://vtop.vit.ac.in/vtop/downloadCourseMaterialFacultyPdf",
+            formEntries: [["_csrf", "secret-tok-retry"], ["authorizedID", "REG_RETRY"]]
+        }
+    );
+
+    const run1 = await manager.start();
+    assert.equal(run1.snapshot.executionCycle, 1);
+    assert.equal(run1.snapshot.completed, 1);
+    assert.equal(run1.snapshot.failed, 3);
+    // Automatic retries remain capped at 3; auth & FS fail in 1 attempt
+    assert.deepEqual(attemptHistory, ["R_OK", "R_RETRY_503", "R_RETRY_503", "R_RETRY_503", "R_AUTH", "R_FS_FAIL"]);
+    assert.equal(run1.snapshot.hasAuthFailure, true);
+    assert.equal(getAuthExpiredWarning(run1.snapshot), AUTH_EXPIRED_SESSION_WARNING);
+
+    // Retry only R_RETRY_503 and R_FS_FAIL (simulate user fixing permission & network recovering)
+    attemptHistory.length = 0;
+    shouldRecover503 = true;
+    const run2 = await manager.retryFailed({ materialIds: ["m2", "m4"] });
+
+    assert.equal(run2.ok, true);
+    assert.equal(run2.snapshot.executionCycle, 2);
+    assert.equal(maxConcurrency, 1);
+    // Completed R_OK is NEVER downloaded again; R_RETRY_503 auto-retries once on cycle 2 and succeeds; R_FS_FAIL succeeds
+    assert.deepEqual(attemptHistory, ["R_RETRY_503", "R_RETRY_503", "R_FS_FAIL"]);
+    assert.equal(run2.snapshot.completed, 3);
+    assert.equal(run2.snapshot.failed, 1);
+
+    const byId = Object.fromEntries(run2.snapshot.items.map((i) => [i.id, i]));
+    assert.equal(byId.m1.manualRetryCount, 0);
+    assert.equal(byId.m2.manualRetryCount, 1);
+    assert.equal(byId.m2.attempts, 2);
+    assert.equal(byId.m2.totalAttempts, 5);
+    assert.equal(byId.m4.manualRetryCount, 1);
+    assert.equal(byId.m3.state, MATERIAL_STATES.FAILED); // untouched failed auth item
+
+    // Preserved courseType + organizationMode folder structure
+    assert.deepEqual(savedPaths, [
+        "BAECE203 - Analog Electronics/ETH - Embedded Theory/FACULTY ONE/R_OK.pdf",
+        "BAECE203 - Analog Electronics/ETH - Embedded Theory/FACULTY ONE/R_RETRY_503.pdf",
+        "BAECE203 - Analog Electronics/ETH - Embedded Theory/FACULTY ONE/R_FS_FAIL.pdf"
+    ]);
+
+    assert.equal(
+        events.some((e) => e.type === QUEUE_EVENTS.QUEUE_RETRY_STARTED && e.executionCycle === 2),
+        true
+    );
+    const retryStartedEvent = events.find(
+        (e) => e.type === QUEUE_EVENTS.MATERIAL_ATTEMPT_STARTED && e.materialId === "m2" && e.executionCycle === 2
+    );
+    assert.equal(retryStartedEvent.isManualRetry, true);
+    assert.equal(retryStartedEvent.manualRetryCount, 1);
+
+    const serialized = JSON.stringify({ snapshot: run2.snapshot, events });
+    assert.equal(serialized.includes("secret-tok-retry"), false);
+    assert.equal(serialized.includes("REG_RETRY"), false);
+});
+
+test("Stage 3C selective download helpers support Select All, Deselect All, Download Selected, Download All, and duplicate prevention", async () => {
+    const course = {
+        courseCode: "BAECE203",
+        courseName: "Analog Electronics",
+        courseType: "ELA - Embedded Lab"
+    };
+    const rawMaterials = [
+        { rowNumber: "1", topic: "Lab 1", uploadedBy: "FACULTY A", fileId: "L001", hasValidFileId: true },
+        { rowNumber: "2", topic: "Lab 2", uploadedBy: "FACULTY A", fileId: "L002", hasValidFileId: true },
+        { rowNumber: "3", topic: "Lab 2 Dup", uploadedBy: "FACULTY A", fileId: "L002", hasValidFileId: true },
+        { rowNumber: "4", topic: "No Attachment", uploadedBy: "FACULTY A", fileId: "", hasValidFileId: false }
+    ];
+
+    const prepared = prepareSelectableMaterials(rawMaterials, course);
+    assert.equal(prepared.length, 4);
+    assert.equal(prepared[0].courseType, "ELA - Embedded Lab");
+
+    // Select All picks all valid-fileId materials, ignores invalid
+    let selected = selectAllMaterials(prepared);
+    assert.equal(countSelectedMaterials(prepared, selected), 3);
+    assert.equal(selected.has(prepared[3].id), false);
+
+    // Download Selected deduplicates duplicate fileIds cleanly
+    const selectedAllPayload = buildSelectedDownloadPayload(prepared, selected, course);
+    assert.deepEqual(
+        selectedAllPayload.map((m) => m.fileId),
+        ["L001", "L002"]
+    );
+
+    // Deselect All clears all
+    selected = deselectAllMaterials();
+    assert.equal(countSelectedMaterials(prepared, selected), 0);
+    assert.deepEqual(buildSelectedDownloadPayload(prepared, selected, course), []);
+
+    // Toggle individual item
+    selected = toggleMaterialSelection(prepared, selected, prepared[1].id, true);
+    selected = toggleMaterialSelection(prepared, selected, prepared[3].id, true); // invalid ignored
+    assert.equal(countSelectedMaterials(prepared, selected), 1);
+    const partialPayload = buildSelectedDownloadPayload(prepared, selected, course);
+    assert.deepEqual(
+        partialPayload.map((m) => m.fileId),
+        ["L002"]
+    );
+    assert.equal(partialPayload[0].courseType, "ELA - Embedded Lab");
+
+    // Download All includes every available material while queue manager skips duplicates/invalid
+    const allPayload = buildAllDownloadPayload(prepared, course);
+    assert.equal(allPayload.length, 4);
+
+    const downloadedIds = [];
+    const manager = new DownloadQueueManager({
+        delayFn: async () => {},
+        downloadMaterial: async ({ fileId }) => {
+            downloadedIds.push(fileId);
+            return {
+                buffer: new Uint8Array([0x25, 0x50, 0x44, 0x46]).buffer,
+                rawFilename: `${fileId}.pdf`,
+                cleanFilename: `${fileId}.pdf`,
+                contentType: "application/pdf",
+                byteLength: 4
+            };
+        },
+        saveMaterial: async ({ downloadResult, folderSegments }) => ({
+            filename: downloadResult.cleanFilename,
+            size: 4,
+            path: `${folderSegments.join("/")}/${downloadResult.cleanFilename}`
+        })
+    });
+
+    manager.loadQueue(partialPayload, {
+        course,
+        organizationMode: ORGANIZATION_MODES.COURSE_ONLY,
+        formAction: "https://vtop.vit.ac.in/vtop/downloadCourseMaterialFacultyPdf",
+        formEntries: [["_csrf", "tok"]]
+    });
+    const selectedRun = await manager.start();
+    assert.deepEqual(downloadedIds, ["L002"]);
+    assert.equal(
+        selectedRun.snapshot.items[0].savedPath,
+        "BAECE203 - Analog Electronics/ELA - Embedded Lab/L002.pdf"
+    );
+
+    downloadedIds.length = 0;
+    manager.loadQueue(allPayload, {
+        course,
+        organizationMode: ORGANIZATION_MODES.COURSE_ONLY,
+        formAction: "https://vtop.vit.ac.in/vtop/downloadCourseMaterialFacultyPdf",
+        formEntries: [["_csrf", "tok"]]
+    });
+    const allRun = await manager.start();
+    assert.deepEqual(downloadedIds, ["L001", "L002"]);
+    assert.equal(allRun.snapshot.completed, 2);
+    assert.equal(allRun.snapshot.skipped, 2);
+});
+
+test("Stage 3C ETH and ELA metadata extraction and folder separation work across both modes without breaking untyped courses or creating duplicate folders", async () => {
+    // 1. Folder organizer preserves compatibility for courses without ETH/ELA and separates ETH/ELA
+    assert.equal(formatCourseTypeFolderSegment({ courseType: "ETH - Embedded Theory" }), "ETH - Embedded Theory");
+    assert.equal(formatCourseTypeFolderSegment({ courseTypeCode: "ELA" }), "ELA - Embedded Lab");
+    assert.equal(formatCourseTypeFolderSegment({ courseCode: "BAECE202" }), "");
+
+    assert.deepEqual(
+        buildTargetFolderSegments({
+            course: {
+                courseCode: "BAECE203",
+                courseName: "Analog Electronics",
+                courseType: "ETH - Embedded Theory"
+            },
+            uploadedBy: "FACULTY ONE",
+            organizeByFaculty: true
+        }),
+        ["BAECE203 - Analog Electronics", "ETH - Embedded Theory", "FACULTY ONE"]
+    );
+    assert.deepEqual(
+        buildTargetFolderSegments({
+            course: {
+                courseCode: "BAECE203",
+                courseName: "Analog Electronics",
+                courseType: "ELA - Embedded Lab"
+            },
+            uploadedBy: "FACULTY ONE",
+            organizeByFaculty: true
+        }),
+        ["BAECE203 - Analog Electronics", "ELA - Embedded Lab", "FACULTY ONE"]
+    );
+    assert.deepEqual(
+        buildTargetFolderSegments({
+            course: {
+                courseCode: "BAECE203",
+                courseName: "Analog Electronics",
+                courseType: "ELA - Embedded Lab"
+            },
+            uploadedBy: "FACULTY ONE",
+            organizeByFaculty: false
+        }),
+        ["BAECE203 - Analog Electronics", "ELA - Embedded Lab"]
+    );
+    assert.deepEqual(
+        buildTargetFolderSegments({
+            course: { courseCode: "BAECE202", courseName: "Engineering Electromagnetics" },
+            uploadedBy: "FACULTY ONE",
+            organizeByFaculty: true
+        }),
+        ["BAECE202 - Engineering Electromagnetics", "FACULTY ONE"]
+    );
+
+    // 2. Parser extracts ETH/ELA from actual VTOP #courseId and courseDetail metadata, while single TH retains existing path
+    async function runExtractionWithCourseOption(optionText, courseDetailCellText, optionsList = null) {
+        const env = createMockBrowserEnv({ rowsTotal: 1, domVisible: 1, dtInitialized: true });
+        const doc = env.sharedGlobal.document;
+        const allOptions = optionsList
+            ? optionsList.map((text) => ({ textContent: text }))
+            : [{ textContent: optionText }];
+        const selectedOption = { textContent: optionText };
+        const origGetElementById = doc.getElementById;
+        doc.getElementById = (id) => {
+            if (id === "courseId") {
+                return {
+                    selectedOptions: [selectedOption],
+                    options: allOptions
+                };
+            }
+            return origGetElementById(id);
+        };
+        const table = origGetElementById("materialTable");
+        const firstRow = table.querySelector("tbody tr");
+        firstRow.cells[1].innerText = courseDetailCellText;
+        runBridgeScripts(env.sharedGlobal);
+        return await new Promise((resolve) => {
+            env.runtimeMessageListeners[0](
+                { type: "EXTRACT_COURSE_MATERIALS" },
+                { id: "ext-id-stage2" },
+                resolve
+            );
+        });
+    }
+
+    const ethExtraction = await runExtractionWithCourseOption(
+        "Fall Semester 2026-27 - BAECE203 - Analog Electronics - ETH - Embedded Theory - 3.0",
+        "Fall Semester 2026-27\nBAECE203 - Analog Electronics - ETH",
+        [
+            "Fall Semester 2026-27 - BAECE203 - Analog Electronics - ETH - Embedded Theory - 3.0",
+            "Fall Semester 2026-27 - BAECE203 - Analog Electronics - ELA - Embedded Lab - 1.0"
+        ]
+    );
+    assert.equal(ethExtraction.course.courseCode, "BAECE203");
+    assert.equal(ethExtraction.course.courseName, "Analog Electronics");
+    assert.equal(ethExtraction.course.courseType, "ETH - Embedded Theory");
+    assert.equal(ethExtraction.materials[0].courseType, "ETH - Embedded Theory");
+
+    const elaExtraction = await runExtractionWithCourseOption(
+        "Fall Semester 2026-27 - BAECE203 - Analog Electronics - ELA - Embedded Lab - 1.0",
+        "Fall Semester 2026-27\nBAECE203 - Analog Electronics - ELA",
+        [
+            "Fall Semester 2026-27 - BAECE203 - Analog Electronics - ETH - Embedded Theory - 3.0",
+            "Fall Semester 2026-27 - BAECE203 - Analog Electronics - ELA - Embedded Lab - 1.0"
+        ]
+    );
+    assert.equal(elaExtraction.course.courseCode, "BAECE203");
+    assert.equal(elaExtraction.course.courseName, "Analog Electronics");
+    assert.equal(elaExtraction.course.courseType, "ELA - Embedded Lab");
+    assert.equal(elaExtraction.materials[0].courseType, "ELA - Embedded Lab");
+
+    // Single TH course without sibling retains existing non-type path
+    const thExtraction = await runExtractionWithCourseOption(
+        "Fall Semester 2026-27 - BAECE202 - Engineering Electromagnetics - TH - Theory Only - 4.0",
+        "Fall Semester 2026-27\nBAECE202 - Engineering Electromagnetics - TH"
+    );
+    assert.equal(thExtraction.course.courseCode, "BAECE202");
+    assert.equal(thExtraction.course.courseType, "");
+    assert.equal(thExtraction.materials[0].courseType, "");
+
+    // 3. Repeated Download All operations reuse exact same folders in FileSystemSaveAdapter (no duplicate folders)
+    const dirHandles = new Map();
+    function getOrCreateDir(parentMap, name) {
+        if (!parentMap.has(name)) {
+            parentMap.set(name, { name, subdirs: new Map(), files: new Map() });
+        }
+        return parentMap.get(name);
+    }
+    const rootNode = { name: "VTOP_Root", subdirs: dirHandles, files: new Map() };
+    function wrapDirHandle(node) {
+        return {
+            name: node.name,
+            getDirectoryHandle: async (seg, { create } = {}) => {
+                if (!node.subdirs.has(seg) && !create) {
+                    throw new Error("NotFound");
+                }
+                return wrapDirHandle(getOrCreateDir(node.subdirs, seg));
+            },
+            keys: async function* () {
+                for (const k of node.files.keys()) yield k;
+            },
+            getFileHandle: async (fileName) => {
+                let bytes = node.files.get(fileName) || new Uint8Array(0);
+                return {
+                    createWritable: async () => ({
+                        write: async (data) => {
+                            bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+                            node.files.set(fileName, bytes);
+                        },
+                        close: async () => {},
+                        abort: async () => {}
+                    }),
+                    getFile: async () => ({ size: bytes.byteLength })
+                };
+            }
+        };
+    }
+
+    const rootHandle = wrapDirHandle(rootNode);
+    const saveAdapter = createFileSystemSaveAdapter({
+        getRootHandle: async () => rootHandle,
+        verifyDirectoryPermission: async () => "granted",
+        ensureSubdirectory: async (root, segments) => {
+            let cur = root;
+            for (const s of segments) {
+                cur = await cur.getDirectoryHandle(s, { create: true });
+            }
+            return cur;
+        },
+        writeBinaryFile
+    });
+
+    const queue = new DownloadQueueManager({
+        delayFn: async () => {},
+        downloadMaterial: async ({ fileId }) => ({
+            buffer: new Uint8Array([0x25, 0x50, 0x44, 0x46]).buffer,
+            rawFilename: `${fileId}.pdf`,
+            cleanFilename: `${fileId}.pdf`,
+            contentType: "application/pdf",
+            byteLength: 4
+        }),
+        saveMaterial: saveAdapter
+    });
+
+    // Run ETH twice and ELA once
+    queue.loadQueue(ethExtraction.materials, {
+        course: ethExtraction.course,
+        organizationMode: ORGANIZATION_MODES.COURSE_FACULTY
+    });
+    await queue.start();
+
+    queue.loadQueue(ethExtraction.materials, {
+        course: ethExtraction.course,
+        organizationMode: ORGANIZATION_MODES.COURSE_FACULTY
+    });
+    await queue.start();
+
+    queue.loadQueue(elaExtraction.materials, {
+        course: elaExtraction.course,
+        organizationMode: ORGANIZATION_MODES.COURSE_FACULTY
+    });
+    await queue.start();
+
+    // Only one top-level course folder, containing exactly two type folders (ETH and ELA)
+    assert.deepEqual(Array.from(rootNode.subdirs.keys()), ["BAECE203 - Analog Electronics"]);
+    const courseNode = rootNode.subdirs.get("BAECE203 - Analog Electronics");
+    assert.deepEqual(
+        Array.from(courseNode.subdirs.keys()).sort(),
+        ["ELA - Embedded Lab", "ETH - Embedded Theory"]
+    );
 });

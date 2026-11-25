@@ -41,8 +41,39 @@ export function buildCourseFolderName(course) {
     return "Unknown Course";
 }
 
+const COURSE_TYPE_LABELS = Object.freeze({
+    ETH: "Embedded Theory",
+    ELA: "Embedded Lab",
+    EPJ: "Embedded Project",
+    TH: "Theory Only",
+    LO: "Lab Only",
+    SS: "Soft Skill"
+});
+
+export function formatCourseTypeFolderSegment(course) {
+    const rawType = typeof course?.courseType === "string" ? course.courseType.trim() : "";
+    if (rawType) {
+        const upper = rawType.toUpperCase();
+        if (COURSE_TYPE_LABELS[upper]) {
+            return sanitizePathSegment(`${upper} - ${COURSE_TYPE_LABELS[upper]}`, "");
+        }
+        return sanitizePathSegment(rawType, "");
+    }
+
+    const rawCode = typeof course?.courseTypeCode === "string" ? course.courseTypeCode.trim().toUpperCase() : "";
+    if (rawCode && COURSE_TYPE_LABELS[rawCode]) {
+        return sanitizePathSegment(`${rawCode} - ${COURSE_TYPE_LABELS[rawCode]}`, "");
+    }
+
+    return "";
+}
+
 export function buildTargetFolderSegments({ course, uploadedBy, organizeByFaculty = false }) {
     const segments = [buildCourseFolderName(course)];
+    const courseTypeSegment = formatCourseTypeFolderSegment(course);
+    if (courseTypeSegment) {
+        segments.push(courseTypeSegment);
+    }
     if (organizeByFaculty) {
         const faculty = sanitizePathSegment(uploadedBy || "", "Unknown Faculty");
         segments.push(faculty);

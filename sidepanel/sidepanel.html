@@ -59,9 +59,6 @@
                 <button id="reauthorize-folder-button" type="button" class="secondary-btn hidden">
                     Re-authorize
                 </button>
-                <button id="test-file-button" type="button" class="secondary-btn" disabled>
-                    Write Test File
-                </button>
             </div>
 
             <p id="fs-feedback" class="feedback hidden"></p>
@@ -95,9 +92,40 @@
                     <option value="course_faculty">Course → Faculty → Materials</option>
                     <option value="course_only">Course → All Materials</option>
                 </select>
-                <button id="start-download-button" type="button" disabled>
-                    Download All
-                </button>
+
+                <div id="selection-toolbar" class="selection-row hidden">
+                    <button id="select-all-button" type="button" class="secondary-btn compact-btn" disabled>
+                        Select All
+                    </button>
+                    <button id="deselect-all-button" type="button" class="secondary-btn compact-btn" disabled>
+                        Deselect All
+                    </button>
+                    <span id="selection-count" class="selection-count">0 selected</span>
+                </div>
+
+                <div class="button-row">
+                    <button id="download-selected-button" type="button" class="secondary-btn" disabled>
+                        Download Selected
+                    </button>
+                    <button id="start-download-button" type="button" disabled>
+                        Download All
+                    </button>
+                </div>
+
+                <div id="queue-action-row" class="button-row hidden">
+                    <button id="pause-queue-button" type="button" class="secondary-btn" disabled>
+                        Pause
+                    </button>
+                    <button id="resume-queue-button" type="button" class="secondary-btn hidden" disabled>
+                        Resume
+                    </button>
+                    <button id="cancel-queue-button" type="button" class="danger-btn" disabled>
+                        Cancel
+                    </button>
+                    <button id="retry-failed-button" type="button" class="secondary-btn hidden" disabled>
+                        Retry Failed
+                    </button>
+                </div>
             </div>
 
             <div id="queue-progress-box" class="progress-box hidden">

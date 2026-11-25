@@ -144,6 +144,37 @@ button:disabled {
     background: #e0e7ff;
 }
 
+.danger-btn {
+    background: #fef2f2;
+    color: #991b1b;
+    border: 1px solid #fecaca;
+}
+
+.danger-btn:hover:not(:disabled) {
+    background: #fee2e2;
+}
+
+.selection-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.compact-btn {
+    width: auto;
+    margin-top: 0;
+    padding: 5px 8px;
+    font-size: 11px;
+}
+
+.selection-count {
+    margin-left: auto;
+    font-size: 11px;
+    font-weight: bold;
+    color: #475569;
+}
+
 .feedback {
     margin-top: 8px;
     padding: 8px 10px;
@@ -170,8 +201,52 @@ button:disabled {
 }
 
 .material-item {
-    padding: 8px 0;
+    padding: 8px 4px;
     border-bottom: 1px solid #f1f5f9;
+    border-radius: 6px;
+}
+
+.material-item.is-selected {
+    background: #eff6ff;
+}
+
+.material-item.state-downloading,
+.material-item.state-retrying {
+    background: #f0f9ff;
+}
+
+.material-item.state-completed {
+    background: #f0fdf4;
+}
+
+.material-item.state-failed {
+    background: #fef2f2;
+}
+
+.material-item.state-cancelled {
+    background: #fffbeb;
+}
+
+.material-item-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+}
+
+.material-checkbox {
+    margin: 2px 0 0;
+    flex-shrink: 0;
+    accent-color: #2563eb;
+    cursor: pointer;
+}
+
+.material-checkbox:disabled {
+    cursor: not-allowed;
+}
+
+.material-content {
+    flex: 1 1 auto;
+    min-width: 0;
 }
 
 .material-title {
@@ -184,6 +259,7 @@ button:disabled {
 .material-meta {
     display: flex;
     justify-content: space-between;
+    align-items: center;
     gap: 8px;
     margin-top: 3px;
     font-size: 11px;
@@ -197,6 +273,42 @@ button:disabled {
     border-radius: 4px;
     color: #334155;
     flex-shrink: 0;
+}
+
+.file-id-tag.status-selected {
+    background: #dbeafe;
+    color: #1d4ed8;
+}
+
+.file-id-tag.status-pending {
+    background: #e2e8f0;
+    color: #334155;
+}
+
+.file-id-tag.status-downloading,
+.file-id-tag.status-retrying {
+    background: #e0f2fe;
+    color: #0369a1;
+}
+
+.file-id-tag.status-completed {
+    background: #dcfce7;
+    color: #166534;
+}
+
+.file-id-tag.status-failed {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+.file-id-tag.status-cancelled {
+    background: #fef3c7;
+    color: #92400e;
+}
+
+.file-id-tag.status-skipped {
+    background: #f1f5f9;
+    color: #64748b;
 }
 
 .hidden {

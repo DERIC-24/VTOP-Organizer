@@ -159,9 +159,31 @@ function safeNotifyProgress(onProgress, progress) {
     }
 }
 
-async function readResponseBufferWithProgress(response, totalBytes, onProgress) {
+function createAbortError(signal, fallbackMessage = "Download aborted.") {
+    if (signal?.reason instanceof Error) {
+        return signal.reason;
+    }
+    const message =
+        typeof signal?.reason === "string" && signal.reason.trim()
+            ? signal.reason.trim()
+            : fallbackMessage;
+    const err = new Error(message);
+    err.name = "AbortError";
+    return err;
+}
+
+function throwIfAborted(signal) {
+    if (signal?.aborted) {
+        throw createAbortError(signal);
+    }
+}
+
+async function readResponseBufferWithProgress(response, totalBytes, onProgress, signal = null) {
+    throwIfAborted(signal);
+
     if (!response.body || typeof response.body.getReader !== "function") {
         const buffer = await response.arrayBuffer();
+        throwIfAborted(signal);
         safeNotifyProgress(onProgress, buildProgressState(buffer.byteLength, totalBytes));
         return buffer;
     }
@@ -170,9 +192,23 @@ async function readResponseBufferWithProgress(response, totalBytes, onProgress) 
     const chunks = [];
     let bytesReceived = 0;
 
+    let onAbort = null;
+    const abortPromise = signal
+        ? new Promise((_, reject) => {
+              onAbort = () => {
+                  reader.cancel(signal.reason).catch(() => {});
+                  reject(createAbortError(signal));
+              };
+              signal.addEventListener("abort", onAbort, { once: true });
+          })
+        : null;
+
     try {
         while (true) {
-            const { done, value } = await reader.read();
+            const readResult = abortPromise
+                ? await Promise.race([reader.read(), abortPromise])
+                : await reader.read();
+            const { done, value } = readResult;
             if (done) {
                 break;
             }
@@ -185,8 +221,13 @@ async function readResponseBufferWithProgress(response, totalBytes, onProgress) 
             safeNotifyProgress(onProgress, buildProgressState(bytesReceived, totalBytes));
         }
     } finally {
+        if (signal && onAbort) {
+            signal.removeEventListener("abort", onAbort);
+        }
         reader.releaseLock?.();
     }
+
+    throwIfAborted(signal);
 
     if (bytesReceived === 0) {
         safeNotifyProgress(onProgress, buildProgressState(0, totalBytes));
@@ -202,7 +243,9 @@ async function readResponseBufferWithProgress(response, totalBytes, onProgress) 
     return combined.buffer;
 }
 
-async function readBoundedPrefix(response, maxBytes = MAX_404_INSPECT_BYTES) {
+async function readBoundedPrefix(response, maxBytes = MAX_404_INSPECT_BYTES, signal = null) {
+    throwIfAborted(signal);
+
     if (!response.body || typeof response.body.getReader !== "function") {
         return new Uint8Array(0);
     }
@@ -212,9 +255,23 @@ async function readBoundedPrefix(response, maxBytes = MAX_404_INSPECT_BYTES) {
     let totalRead = 0;
     let reachedCap = false;
 
+    let onAbort = null;
+    const abortPromise = signal
+        ? new Promise((_, reject) => {
+              onAbort = () => {
+                  reader.cancel(signal.reason).catch(() => {});
+                  reject(createAbortError(signal));
+              };
+              signal.addEventListener("abort", onAbort, { once: true });
+          })
+        : null;
+
     try {
         while (totalRead < maxBytes) {
-            const { done, value } = await reader.read();
+            const readResult = abortPromise
+                ? await Promise.race([reader.read(), abortPromise])
+                : await reader.read();
+            const { done, value } = readResult;
             if (done) {
                 break;
             }
@@ -233,11 +290,16 @@ async function readBoundedPrefix(response, maxBytes = MAX_404_INSPECT_BYTES) {
             totalRead += chunk.byteLength;
         }
     } finally {
+        if (signal && onAbort) {
+            signal.removeEventListener("abort", onAbort);
+        }
         if (reachedCap) {
             await reader.cancel().catch(() => {});
         }
         reader.releaseLock?.();
     }
+
+    throwIfAborted(signal);
 
     const prefix = new Uint8Array(totalRead);
     let offset = 0;
@@ -248,7 +310,8 @@ async function readBoundedPrefix(response, maxBytes = MAX_404_INSPECT_BYTES) {
     return prefix;
 }
 
-async function detectAuthFailureOn404(response, contentType) {
+async function detectAuthFailureOn404(response, contentType, signal = null) {
+    throwIfAborted(signal);
     if (typeof response.url === "string" && response.url) {
         try {
             const resolved = new URL(response.url);
@@ -267,7 +330,7 @@ async function detectAuthFailureOn404(response, contentType) {
         return false;
     }
 
-    const prefixBytes = await readBoundedPrefix(response, MAX_404_INSPECT_BYTES);
+    const prefixBytes = await readBoundedPrefix(response, MAX_404_INSPECT_BYTES, signal);
     if (prefixBytes.byteLength === 0) {
         return false;
     }
@@ -281,7 +344,8 @@ export async function downloadMaterial({
     formEntries,
     fileId,
     fallbackTitle = "material",
-    onProgress = null
+    onProgress = null,
+    signal = null
 }) {
     let targetUrl;
     try {
@@ -294,12 +358,20 @@ export async function downloadMaterial({
         throw new DownloadError("UNTRUSTED_ORIGIN", "Refusing download to non-VTOP origin.");
     }
 
+    throwIfAborted(signal);
+
     const body = buildFormBody(formEntries, fileId);
-    const response = await fetch(targetUrl.href, {
+    const fetchInit = {
         method: "POST",
         credentials: "include",
         body
-    });
+    };
+    if (signal) {
+        fetchInit.signal = signal;
+    }
+    const response = await fetch(targetUrl.href, fetchInit);
+
+    throwIfAborted(signal);
 
     const contentType = response.headers.get("content-type") || "";
     const contentDisposition = response.headers.get("content-disposition") || "";
@@ -308,7 +380,7 @@ export async function downloadMaterial({
     // Reject non-2xx responses before streaming body or emitting progress
     if (!response.ok) {
         if (response.status === 404) {
-            const isAuthFailure = await detectAuthFailureOn404(response, contentType);
+            const isAuthFailure = await detectAuthFailureOn404(response, contentType, signal);
             if (isAuthFailure) {
                 throw new DownloadError(
                     "SESSION_EXPIRED",
@@ -331,7 +403,7 @@ export async function downloadMaterial({
         });
     }
 
-    const buffer = await readResponseBufferWithProgress(response, totalBytes, onProgress);
+    const buffer = await readResponseBufferWithProgress(response, totalBytes, onProgress, signal);
 
     const validated = validateDownloadedBinary({
         status: response.status,
