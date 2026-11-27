@@ -16,7 +16,7 @@
         <div class="brand">
             <div class="brand-icon">V</div>
 
-            <div>
+            <div class="brand-text">
                 <h1>VTOP Organizer</h1>
                 <p>Course Material Manager</p>
             </div>
@@ -26,7 +26,10 @@
     <main>
 
         <section class="card status-card">
-            <span class="label">CONNECTION STATUS</span>
+            <span class="label">
+                <span class="label-icon">⚡</span>
+                CONNECTION
+            </span>
 
             <h2 id="status-title">
                 Checking browser...
@@ -42,7 +45,10 @@
         </section>
 
         <section class="card folder-card">
-            <span class="label">DESTINATION DIRECTORY</span>
+            <span class="label">
+                <span class="label-icon">📂</span>
+                DESTINATION
+            </span>
 
             <h2 id="folder-name">
                 No folder selected
@@ -65,7 +71,10 @@
         </section>
 
         <section class="card course-card">
-            <span class="label">CURRENT COURSE</span>
+            <span class="label">
+                <span class="label-icon">📖</span>
+                CURRENT COURSE
+            </span>
 
             <h2 id="course-name">
                 No course detected
@@ -78,7 +87,10 @@
 
         <section class="card materials-card">
             <div class="card-header-row">
-                <span class="label">EXTRACTED MATERIALS</span>
+                <span class="label">
+                    <span class="label-icon">📄</span>
+                    MATERIALS
+                </span>
                 <span id="materials-badge" class="badge">0</span>
             </div>
 
@@ -150,7 +162,7 @@
     </main>
 
     <footer>
-        VTOP Organizer · Version 0.1.0
+        VTOP Organizer · v0.1.0
     </footer>
 
     <script type="module" src="sidepanel.js"></script>
